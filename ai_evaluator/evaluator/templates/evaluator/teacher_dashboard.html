@@ -96,7 +96,11 @@
                                 </span>
                             </td>
                             <td class="px-8 py-6">
+                                {% if submission.question.question_type == 'MCQ' %}
+                                <p class="text-sm text-gray-600 line-clamp-1 max-w-xs font-medium">{{ submission.selected_choice.text|default:"None" }}</p>
+                                {% else %}
                                 <p class="text-sm text-gray-600 line-clamp-1 max-w-xs italic">"{{ submission.student_answer }}"</p>
+                                {% endif %}
                             </td>
                             <td class="px-8 py-6 text-center">
                                 <span class="text-lg font-black {% if submission.score >= 0.7 %}text-emerald-600{% elif submission.score >= 0.4 %}text-amber-500{% else %}text-rose-500{% endif %}">
