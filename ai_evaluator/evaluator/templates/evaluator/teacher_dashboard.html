@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teacher Dashboard | AI Evaluator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+    </style>
+</head>
+<body class="min-h-screen">
+    <nav class="bg-indigo-900 shadow-xl border-b border-indigo-800">
+        <div class="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
+            <div class="flex items-center gap-4">
+                <div class="bg-indigo-500 p-2 rounded-lg">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                    </svg>
+                </div>
+                <h1 class="text-xl font-bold text-white">AI Educator Dashboard</h1>
+            </div>
+            <a href="{% url 'student_portal' %}" class="text-indigo-200 hover:text-white transition text-sm font-medium">Switch to Student Portal</a>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto p-6 md:p-10">
+        <!-- Stats Overview -->
+        <header class="mb-10 grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-1">Average Score</p>
+                    <h2 class="text-3xl font-black text-indigo-600">{{ stats.avg_score|floatformat:1 }}%</h2>
+                </div>
+                <div class="bg-indigo-50 p-4 rounded-full">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                    </svg>
+                </div>
+            </div>
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-1">Total Submissions</p>
+                    <h2 class="text-3xl font-black text-gray-900">{{ stats.total_submissions }}</h2>
+                </div>
+                <div class="bg-emerald-50 p-4 rounded-full">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                    </svg>
+                </div>
+            </div>
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-bold text-rose-400 uppercase tracking-widest mb-1">Needs Review</p>
+                    <h2 class="text-3xl font-black text-rose-600">{{ stats.needs_review_total }}</h2>
+                </div>
+                <div class="bg-rose-50 p-4 rounded-full">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-rose-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                </div>
+            </div>
+        </header>
+
+        <!-- Submissions Table -->
+        <section class="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+            <div class="p-8 border-b border-gray-100 flex justify-between items-center">
+                <h3 class="text-xl font-bold text-gray-900">Recent Class Activity</h3>
+                <div class="flex gap-2">
+                    <button class="px-4 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50 rounded-lg transition border border-gray-200">Export CSV</button>
+                    <button class="px-4 py-2 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition shadow-sm">Add Question</button>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead>
+                        <tr class="bg-slate-50 text-gray-400 text-xs font-bold uppercase tracking-widest">
+                            <th class="px-8 py-4">Submission Date</th>
+                            <th class="px-8 py-4">Question Type</th>
+                            <th class="px-8 py-4">Student Answer</th>
+                            <th class="px-8 py-4 text-center">Score</th>
+                            <th class="px-8 py-4 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-100">
+                        {% for submission in submissions %}
+                        <tr class="hover:bg-indigo-50/30 transition group">
+                            <td class="px-8 py-6">
+                                <span class="text-sm font-semibold text-gray-900">{{ submission.created_at|date:"M d, Y" }}</span><br>
+                                <span class="text-xs text-gray-400">{{ submission.created_at|time }}</span>
+                            </td>
+                            <td class="px-8 py-6">
+                                <span class="px-3 py-1 text-[10px] font-bold rounded-full bg-slate-100 text-slate-600 uppercase">
+                                    {{ submission.question.get_question_type_display }}
+                                </span>
+                            </td>
+                            <td class="px-8 py-6">
+                                <p class="text-sm text-gray-600 line-clamp-1 max-w-xs italic">"{{ submission.student_answer }}"</p>
+                            </td>
+                            <td class="px-8 py-6 text-center">
+                                <span class="text-lg font-black {% if submission.score >= 0.7 %}text-emerald-600{% elif submission.score >= 0.4 %}text-amber-500{% else %}text-rose-500{% endif %}">
+                                    {{ submission.score_percentage }}%
+                                </span>
+                            </td>
+                            <td class="px-8 py-6 text-right">
+                                <a href="{% url 'result_view' submission.id %}" class="inline-flex items-center gap-1 text-sm font-bold text-indigo-600 hover:text-indigo-800 transition">
+                                    View Detailed Insights
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                                    </svg>
+                                </a>
+                            </td>
+                        </tr>
+                        {% empty %}
+                        <tr>
+                            <td colspan="5" class="px-8 py-20 text-center text-gray-500">No submissions recorded yet.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <div class="p-6 bg-slate-50 border-t border-gray-100 text-center">
+                <a href="#" class="text-xs font-bold text-gray-400 hover:text-indigo-600 uppercase tracking-widest transition">Load More Submissions</a>
+            </div>
+        </section>
+    </main>
+</body>
+</html>

@@ -66,9 +66,14 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 from pathlib import Path
+import os
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables
+load_dotenv(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -92,6 +97,7 @@ INSTALLED_APPS = ['evaluator',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django_q',
 ]
 
 MIDDLEWARE = [
@@ -171,6 +177,21 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# Django-Q2 Configuration (using ORM as broker for simplicity)
+Q_CLUSTER = {
+    'name': 'DjangORM',
+    'workers': 4,
+    'timeout': 90,
+    'retry': 120,
+    'queue_limit': 50,
+    'bulk': 10,
+    'orm': 'default'
+}
+
+# DeepSeek Configuration
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
 
 ================================================================================
 FILE: ai_evaluator\urls.py
@@ -217,13 +238,47 @@ FILE: evaluator\admin.py
 ================================================================================
 
 from django.contrib import admin
+from .models import Question, Choice, Rubric, Submission
 
-# Register your models here.
-from .models import Question, Rubric, Submission
+class ChoiceInline(admin.TabularInline):
+    model = Choice
+    extra = 3
 
-admin.site.register(Question)
-admin.site.register(Rubric)
-admin.site.register(Submission)
+class RubricInline(admin.StackedInline):
+    model = Rubric
+    extra = 1
+
+@admin.register(Question)
+class QuestionAdmin(admin.ModelAdmin):
+    list_display = ('text_preview', 'question_type')
+    list_filter = ('question_type',)
+    search_fields = ('text', 'model_answer')
+    inlines = [ChoiceInline, RubricInline]
+
+    def text_preview(self, obj):
+        return obj.text[:100]
+    text_preview.short_description = 'Question Text'
+
+@admin.register(Rubric)
+class RubricAdmin(admin.ModelAdmin):
+    list_display = ('question', 'criteria')
+    search_fields = ('question__text',)
+
+@admin.register(Choice)
+class ChoiceAdmin(admin.ModelAdmin):
+    list_display = ('question', 'text', 'is_correct')
+    list_filter = ('is_correct',)
+    search_fields = ('text', 'question__text')
+
+@admin.register(Submission)
+class SubmissionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'question', 'score', 'letter_grade', 'created_at')
+    list_filter = ('question__question_type', 'created_at')
+    readonly_fields = ('score', 'criteria_scores', 'feedback', 'created_at')
+    
+    def letter_grade(self, obj):
+        return obj.get_grade
+    letter_grade.short_description = 'Grade'
 
 ================================================================================
 FILE: evaluator\apps.py
@@ -233,7 +288,11 @@ from django.apps import AppConfig
 
 
 class EvaluatorConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
     name = 'evaluator'
+
+    def ready(self):
+        import evaluator.signals
 
 
 ================================================================================
@@ -254,9 +313,17 @@ class Question(models.Model):
     text = models.TextField()   #store question + no  character limit
     question_type = models.CharField(max_length=3, choices=QUESTION_TYPES)  #stores type of question.
     model_answer = models.TextField()   #Stores model answer
-#Controls how object appears in admin panel Shows first 50 characters of question ,Makes admin readable
+    #Controls how object appears in admin panel Shows first 50 characters of question ,Makes admin readable
     def __str__(self):
         return self.text[:50]
+
+class Choice(models.Model):
+    question = models.ForeignKey(Question, related_name='choices', on_delete=models.CASCADE)
+    text = models.CharField(max_length=255)
+    is_correct = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.question.text[:20]}... - {self.text}"
 
 #Used to define grading rules
 class Rubric(models.Model):
@@ -266,12 +333,60 @@ class Rubric(models.Model):
 #stored student answer + result
 class Submission(models.Model):
     question = models.ForeignKey(Question, on_delete=models.CASCADE)    #each submission belongs to a question 
-    student_answer = models.TextField() #student answer
+    student_answer = models.TextField(null=True, blank=True) #student answer (for FIB/SUB)
+    selected_choice = models.ForeignKey(Choice, null=True, blank=True, on_delete=models.SET_NULL) # for MCQ
 
-    score = models.FloatField(null=True, blank=True) #Stores marks
-    feedback = models.TextField(null=True, blank=True) #AI-generated feedback
+    score = models.FloatField(null=True, blank=True) # Thresholded score (0.0-1.0)
+    raw_score = models.FloatField(null=True, blank=True) # Raw similarity/exact match score (0.0-1.0)
+    criteria_scores = models.JSONField(null=True, blank=True) # Per-rubric scores {"accuracy": 80, "grammar": 70}
+    feedback = models.JSONField(null=True, blank=True) #Structured AI-generated feedback
 
     created_at = models.DateTimeField(auto_now_add=True) #Automatically stores submission time ,No need to set manually Example: 2026-03-27 14:30
+
+    @property
+    def scoring_type(self):
+        """Derives scoring type: SEMANTIC for subjective, OBJECTIVE for MCQ/FIB."""
+        if self.question.question_type == 'SUB':
+            return 'SEMANTIC'
+        return 'OBJECTIVE'
+
+    @property
+    def get_grade(self):
+        if self.score is None:
+            return "N/A"
+        
+        if self.score >= 0.85: return "A"
+        elif self.score >= 0.7: return "B"
+        elif self.score >= 0.5: return "C"
+        elif self.score >= 0.3: return "D"
+        else: return "F"
+
+    @property
+    def score_percentage(self):
+        if self.score is None:
+            return 0
+        return round(self.score * 100, 0)
+
+    def __str__(self):
+        return f"Submission {self.id} - {self.question.question_type}"
+
+================================================================================
+FILE: evaluator\signals.py
+================================================================================
+
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from django_q.tasks import async_task
+from .models import Submission
+
+@receiver(post_save, sender=Submission)
+def trigger_feedback_generation(sender, instance, created, **kwargs):
+    # Only generate feedback if it's a new submission or if score is set but feedback is missing
+    if created or (instance.score is not None and not instance.feedback):
+        # Prevent recursion by checking if feedback is already being generated or exists
+        if not instance.feedback:
+            async_task('evaluator.services.feedback_service.generate_feedback_task', instance.id)
+
 
 ================================================================================
 FILE: evaluator\tests.py
@@ -287,64 +402,179 @@ FILE: evaluator\urls.py
 ================================================================================
 
 from django.urls import path
-from .views import home, evaluate 
-urlpatterns = [ path('', home),
-    path('evaluate/', evaluate),
+from . import views
+
+urlpatterns = [
+    path('', views.home, name='home'),
+    path('evaluate/', views.evaluate, name='evaluate'),
+    path('portal/', views.student_portal, name='student_portal'),
+    path('submit/<int:question_id>/', views.submit_answer, name='submit_answer'),
+    path('result/<int:submission_id>/', views.result_view, name='result_view'),
+    path('teacher/', views.teacher_dashboard, name='teacher_dashboard'),
 ]
 
 ================================================================================
 FILE: evaluator\views.py
 ================================================================================
 
-#from django.shortcuts import render #used to return HTML structrued response
-
-# Create your views here.
+from django.shortcuts import render, get_object_or_404, redirect
 from django.http import JsonResponse
 from .models import Question, Submission
 from .services.grading_service import grade_objective
-from .services.semantic_service import semantic_score
-from .services.feedback_service import generate_feedback
+from .services.semantic_service import SemanticEvaluator
 
 import json
 def home(request):
     return JsonResponse({
-        "message": "Welcome to AI Evaluator 🚀"
+        "message": "Welcome to AI Evaluator "
     })
-
-
+from django.views.decorators.csrf import csrf_exempt
+#to test api I have written @csrf_exempt
+@csrf_exempt
 def evaluate(request):
-    if request.method == "GET":
-        return JsonResponse({
-            "message": "Use POST request with JSON data"
-        })
     if request.method == "POST":
         data = json.loads(request.body)
+        question_id = data.get("question_id")
+        student_answer = data.get("answer")
 
-        question = Question.objects.get(id=data["question_id"])
-        student_answer = data["answer"]
+        question = get_object_or_404(Question, id=question_id)
+        
+        # 1. Fetch Rubric
+        from .models import Rubric
+        rubric = Rubric.objects.filter(question=question).first()
+        rubric_criteria = rubric.criteria if rubric else None
 
-        score = None
+        # 2. Objective Scoring & MCQ Validation
+        selected_choice_id = data.get("selected_choice_id")
+        
+        # Validation: Check if choice belongs to this question
+        if selected_choice_id:
+            from .models import Choice
+            if not Choice.objects.filter(id=selected_choice_id, question=question).exists():
+                return JsonResponse({"error": "Invalid choice for this question"}, status=400)
 
-        # Objective
-        score = grade_objective(question, student_answer)
+        score = grade_objective(question, student_answer, selected_choice_id=selected_choice_id)
+        raw_score = score # Objective score is the raw score
+        
+        # Determine criteria scores for objective
+        if score is not None:
+            criteria_scores = {"accuracy": score * 100}
+        else:
+            criteria_scores = None
 
-        # Subjective
+        # 3. Semantic Evaluation if not objective
         if score is None:
-            score = semantic_score(question.model_answer, student_answer)
+            evaluator = SemanticEvaluator()
+            score, criteria_scores, raw_score = evaluator.evaluate(
+                question.model_answer, 
+                student_answer, 
+                rubric_criteria=rubric_criteria
+            )
 
-        feedback = generate_feedback(score)
-
+        # 4. Create Submission (Signals will trigger async feedback)
         submission = Submission.objects.create(
             question=question,
             student_answer=student_answer,
+            selected_choice_id=selected_choice_id,
             score=score,
-            feedback=feedback
+            raw_score=raw_score,
+            criteria_scores=criteria_scores
         )
 
         return JsonResponse({
+            "submission_id": submission.id,
             "score": score,
-            "feedback": feedback
+            "status": "Feedback being generated..."
         })
+    return JsonResponse({"error": "POST request required"}, status=400)
+
+def student_portal(request):
+    questions = Question.objects.all()
+    return render(request, 'evaluator/student_portal.html', {'questions': questions})
+
+def submit_answer(request, question_id):
+    if request.method == "POST":
+        question = get_object_or_404(Question, id=question_id)
+        student_answer = request.POST.get("answer")
+        
+        # 1. Fetch Rubric
+        from .models import Rubric
+        rubric = Rubric.objects.filter(question=question).first()
+        rubric_criteria = rubric.criteria if rubric else None
+
+        # 2. Grading logic & MCQ Validation
+        selected_choice_id = request.POST.get("selected_choice")
+        
+        # Validation: Check if choice belongs to this question
+        if selected_choice_id:
+            from .models import Choice
+            if not Choice.objects.filter(id=selected_choice_id, question=question).exists():
+                return redirect('student_portal')
+
+        score = grade_objective(question, student_answer, selected_choice_id=selected_choice_id)
+        raw_score = score # Objective score is its own raw score
+        
+        if score is not None:
+            criteria_scores = {"accuracy": score * 100}
+        else:
+            criteria_scores = None
+        
+        if score is None:
+            evaluator = SemanticEvaluator()
+            score, criteria_scores, raw_score = evaluator.evaluate(
+                question.model_answer, 
+                student_answer, 
+                rubric_criteria=rubric_criteria
+            )
+            
+        submission = Submission.objects.create(
+            question=question,
+            student_answer=student_answer,
+            selected_choice_id=selected_choice_id,
+            score=score,
+            raw_score=raw_score,
+            criteria_scores=criteria_scores
+        )
+        return redirect('result_view', submission_id=submission.id)
+    return redirect('student_portal')
+
+def result_view(request, submission_id):
+    submission = get_object_or_404(Submission, id=submission_id)
+    return render(request, 'evaluator/result_view.html', {'submission': submission})
+
+def teacher_dashboard(request):
+    submissions = Submission.objects.select_related('question').all().order_by('-created_at')
+    
+    # Teacher Analytics Enhancement
+    from django.db.models import Avg, Count, Max, Min
+    
+    # Aggregated insights across submissions
+    from django.db.models import Q
+    performance_by_type = submissions.values('question__question_type').annotate(
+        avg_score=Avg('score'),
+        avg_raw_score=Avg('raw_score'),
+        count=Count('id'),
+        pass_rate=Count('id', filter=Q(score__gte=0.5)) * 100.0 / Count('id'),
+        needs_review=Count('id', filter=Q(score__lt=0.3))
+    )
+
+    stats_raw = submissions.aggregate(
+        overall_avg=Avg('score'),
+        raw_avg=Avg('raw_score', filter=Q(question__question_type='SUB'))
+    )
+
+    stats = {
+        'avg_score': stats_raw['overall_avg'] if stats_raw['overall_avg'] is not None else 0.0,
+        'avg_raw_similarity': stats_raw['raw_avg'] if stats_raw['raw_avg'] is not None else 0.0,
+        'total_submissions': submissions.count(),
+        'by_type': performance_by_type,
+        'needs_review_total': submissions.filter(score__lt=0.3).count(),
+    }
+    
+    return render(request, 'evaluator/teacher_dashboard.html', {
+        'submissions': submissions,
+        'stats': stats
+    })
 
 ================================================================================
 FILE: evaluator\__init__.py
@@ -402,6 +632,98 @@ class Migration(migrations.Migration):
 
 
 ================================================================================
+FILE: evaluator\migrations\0002_submission_criteria_scores_alter_submission_feedback.py
+================================================================================
+
+# Generated by Django 6.0.3 on 2026-03-30 07:33
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('evaluator', '0001_initial'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='submission',
+            name='criteria_scores',
+            field=models.JSONField(blank=True, null=True),
+        ),
+        migrations.AlterField(
+            model_name='submission',
+            name='feedback',
+            field=models.JSONField(blank=True, null=True),
+        ),
+    ]
+
+
+================================================================================
+FILE: evaluator\migrations\0003_alter_submission_student_answer_choice_and_more.py
+================================================================================
+
+# Generated by Django 5.2.1 on 2026-03-30 09:44
+
+import django.db.models.deletion
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('evaluator', '0002_submission_criteria_scores_alter_submission_feedback'),
+    ]
+
+    operations = [
+        migrations.AlterField(
+            model_name='submission',
+            name='student_answer',
+            field=models.TextField(blank=True, null=True),
+        ),
+        migrations.CreateModel(
+            name='Choice',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('text', models.CharField(max_length=255)),
+                ('is_correct', models.BooleanField(default=False)),
+                ('question', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='choices', to='evaluator.question')),
+            ],
+        ),
+        migrations.AddField(
+            model_name='submission',
+            name='selected_choice',
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to='evaluator.choice'),
+        ),
+    ]
+
+
+================================================================================
+FILE: evaluator\migrations\0004_submission_raw_score.py
+================================================================================
+
+# Generated by Django 5.2.1 on 2026-03-30 10:03
+
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('evaluator', '0003_alter_submission_student_answer_choice_and_more'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='submission',
+            name='raw_score',
+            field=models.FloatField(blank=True, null=True),
+        ),
+    ]
+
+
+================================================================================
 FILE: evaluator\migrations\__init__.py
 ================================================================================
 
@@ -411,25 +733,144 @@ FILE: evaluator\migrations\__init__.py
 FILE: evaluator\services\feedback_service.py
 ================================================================================
 
-#Later I will replace it with deepseek
-def generate_feedback(score):
-    if score > 0.8:
-        return "Excellent answer."
-    elif score > 0.5:
-        return "Good, but can improve."
-    else:
-        return "Needs improvement."
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from django.conf import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+class FeedbackGenerator:
+    def __init__(self):
+        self.llm = ChatOpenAI(
+            openai_api_key=settings.DEEPSEEK_API_KEY,
+            openai_api_base=settings.DEEPSEEK_BASE_URL,
+            model_name="deepseek-chat",
+            temperature=0.3
+        )
+        self.parser = JsonOutputParser()
+
+    def get_system_prompt(self, similarity_score):
+        # Module 5: Prompt Constraint Enforcement logic
+        tone_instruction = ""
+        if similarity_score < 0.3:
+            tone_instruction = "CRITICAL: The student failed significantly. Be firm, highlight major gaps, and avoid any praise."
+        elif similarity_score < 0.6:
+            tone_instruction = "CAUTIONARY: The student has partial understanding. Be encouraging but very clear about what is missing."
+        elif similarity_score < 0.85:
+            tone_instruction = "POSITIVE: Good work. Provide minor corrections and suggestions for perfection."
+        else:
+            tone_instruction = "CELEBRATORY: Excellent work! Focus only on tiny stylistic or extra-depth points."
+
+        return (
+            "You are a 'Fair Educator' AI assessment assistant. Your job is to provide constructive, "
+            "honest, and structured feedback in JSON format."
+            f"\n\nTONE GUIDELINE: {tone_instruction}"
+            "\n\nSTRICT GUIDELINES:"
+            f"\n1. Your feedback MUST strictly reflect the similarity score of {similarity_score}/1.0."
+            "\n2. Do NOT give high praise for low scores, and do NOT be overly harsh for high scores."
+            "\n3. You MUST return a valid JSON object matching the schema below."
+            "\n\nReturn only the JSON object."
+        )
+
+    def generate(self, question_text, model_answer, student_answer, score, raw_score):
+        # Handle None inside logic instead of default parameters
+        local_score = score if score is not None else 0.0
+        local_raw_score = raw_score if raw_score is not None else local_score
+
+        # Module 5: Prompt Constraint Enforcement (Tone based on thresholded score)
+        system_prompt = self.get_system_prompt(local_score)
+        
+        user_prompt = (
+            "Question: {question_text}"
+            "\nModel Answer: {model_answer}"
+            "\nStudent Answer: {student_answer}"
+            "\n\nASSESSMENT DATA:"
+            f"\n- Final Score: {local_score}/1.0"
+            f"\n- Raw Similarity/Accuracy: {local_raw_score}/1.0"
+            "\n\n{format_instructions}"
+        )
+
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("user", user_prompt),
+        ])
+
+        try:
+            # Module 4: Clean LCEL Pipeline
+            chain = prompt_template | self.llm | self.parser
+            
+            return chain.invoke({
+                "question_text": question_text,
+                "model_answer": model_answer,
+                "student_answer": student_answer,
+                "format_instructions": self.parser.get_format_instructions()
+            })
+            
+        except Exception as e:
+            logger.error(f"Error generating feedback: {e}")
+            return {
+                "explanation": "Could not generate detailed feedback at this time.",
+                "strengths": "N/A",
+                "weaknesses": "Check similarity score for context.",
+                "suggestions": "Try again later.",
+                "suggested_reading": ["Review the core topic in your textbook."]
+            }
+
+# Wrapper for background task
+def generate_feedback_task(submission_id):
+    from evaluator.models import Submission
+    try:
+        submission = Submission.objects.get(id=submission_id)
+        generator = FeedbackGenerator()
+        
+        # Ensure student_answer is always a string context
+        student_answer = submission.student_answer if submission.student_answer is not None else ""
+        if submission.selected_choice is not None:
+             student_answer = submission.selected_choice.text
+        
+        # Explicit Null Handling for raw_score fallback at runtime
+        final_score = submission.score if submission.score is not None else 0.0
+        final_raw_score = submission.raw_score
+        
+        if final_raw_score is None:
+            logger.warning(f"Submission {submission_id} has NULL raw_score. Falling back to score.")
+            final_raw_score = final_score
+
+        feedback = generator.generate(
+            submission.question.text,
+            submission.question.model_answer,
+            student_answer,
+            final_score,
+            final_raw_score
+        )
+        submission.feedback = feedback
+        submission.save()
+    except Exception as e:
+        logger.error(f"Failed background feedback generation for submission {submission_id}: {e}")
 
 ================================================================================
 FILE: evaluator\services\grading_service.py
 ================================================================================
 
-def grade_objective(question, student_answer):
+def grade_objective(question, student_answer, selected_choice_id=None):
     if question.question_type == "MCQ":
-        return 1 if student_answer == question.model_answer else 0
+        if selected_choice_id:
+            from evaluator.models import Choice
+            try:
+                choice = Choice.objects.get(id=selected_choice_id)
+                return 1.0 if choice.is_correct else 0.0
+            except Choice.DoesNotExist:
+                return 0.0
+        return 1.0 if student_answer == question.model_answer else 0.0
 
     elif question.question_type == "FIB":
-        return 1 if student_answer.strip().lower() == question.model_answer.strip().lower() else 0
+        if not student_answer:
+            return 0.0
+        correct = question.model_answer.strip().lower()
+        student = student_answer.strip().lower()
+        return 1.0 if correct == student else 0.0
 
     return None
 
@@ -438,12 +879,507 @@ FILE: evaluator\services\semantic_service.py
 ================================================================================
 
 from sentence_transformers import SentenceTransformer, util
+import os
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
+class SemanticEvaluator:
+    _model = None
 
-def semantic_score(model_answer, student_answer):
-    emb1 = model.encode(model_answer, convert_to_tensor=True)
-    emb2 = model.encode(student_answer, convert_to_tensor=True)
+    @classmethod
+    def get_model(cls):
+        if cls._model is None:
+            # Reusable model loading
+            cls._model = SentenceTransformer('all-MiniLM-L6-v2')
+        return cls._model
 
-    similarity = util.cos_sim(emb1, emb2)
-    return float(similarity[0][0])
+    def evaluate(self, model_answer, student_answer, rubric_criteria=None):
+        """
+        Evaluates the student answer based on the model answer and optional rubric criteria.
+        Returns a tuple: (final_weighted_score, criteria_scores)
+        """
+        model = self.get_model()
+        
+        # 1. Calculate Accuracy (Semantic Similarity)
+        emb1 = model.encode(model_answer, convert_to_tensor=True)
+        emb2 = model.encode(student_answer, convert_to_tensor=True)
+        similarity = float(util.cos_sim(emb1, emb2)[0][0])
+        accuracy_score = self._calculate_similarity_score(similarity)
+
+        # 2. Calculate Grammar (Heuristic)
+        grammar_score = self._calculate_grammar_heuristic(student_answer)
+
+        # 3. Apply Rubric Weighting
+        if not rubric_criteria:
+            # Default to 100% accuracy if no rubric provided
+            return accuracy_score, {"accuracy": accuracy_score * 100}, similarity
+
+        final_score = 0
+        per_criteria_results = {}
+        
+        for criterion, weight in rubric_criteria.items():
+            if criterion.lower() == "accuracy":
+                final_score += accuracy_score * (weight / 100)
+                per_criteria_results["accuracy"] = round(accuracy_score * 100, 2)
+            elif criterion.lower() == "grammar":
+                final_score += grammar_score * (weight / 100)
+                per_criteria_results["grammar"] = round(grammar_score * 100, 2)
+            else:
+                # Default for unknown criteria: use accuracy as proxy
+                final_score += accuracy_score * (weight / 100)
+                per_criteria_results[criterion] = round(accuracy_score * 100, 2)
+
+        return round(final_score, 2), per_criteria_results, round(similarity, 4)
+
+    def _calculate_similarity_score(self, similarity):
+        if similarity > 0.85: return 1.0
+        elif similarity > 0.7: return 0.8
+        elif similarity > 0.5: return 0.6
+        elif similarity > 0.3: return 0.4
+        else: return 0.1
+
+    def _calculate_grammar_heuristic(self, text):
+        """Simple heuristic for grammar scoring."""
+        if not text: return 0.0
+        score = 1.0
+        
+        # Checklist
+        # 1. Starts with capital letter
+        if not text[0].isupper(): score -= 0.2
+        # 2. Ends with punctuation
+        if text[-1] not in ".!?": score -= 0.2
+        # 3. Minimum length (at least 3 words)
+        words = text.split()
+        if len(words) < 3: score -= 0.3
+        # 4. Basic capitalization (proper nouns/I) - simplified
+        if " i " in text: score -= 0.1 # Should be " I "
+        
+        return max(0.1, score)
+
+================================================================================
+FILE: evaluator\templates\evaluator\result_view.html
+================================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Result View | AI Evaluator</title>
+    {% if not submission.feedback %}
+    <meta http-equiv="refresh" content="5">
+    {% endif %}
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+        .progress-bar { transition: width 1s ease-in-out; }
+    </style>
+</head>
+<body class="min-h-screen">
+    <nav class="bg-white shadow-sm border-b">
+        <div class="max-w-6xl mx-auto px-4 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-bold text-indigo-600">AI Assessment Engine</h1>
+            <div class="flex gap-4">
+                <a href="{% url 'student_portal' %}" class="text-sm text-gray-500 hover:text-indigo-600 transition">Back to Portal</a>
+                <a href="{% url 'teacher_dashboard' %}" class="text-sm text-gray-500 hover:text-indigo-600 transition">Teacher Dashboard</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto p-6 md:p-12">
+        <div class="bg-white rounded-3xl shadow-xl overflow-hidden border border-gray-100">
+            <div class="bg-indigo-600 p-8 text-white relative overflow-hidden">
+                <div class="relative z-10">
+                    <h2 class="text-2xl font-bold mb-2 opacity-90">Assessment Results</h2>
+                    <p class="text-indigo-100">{{ submission.question.text|truncatechars:100 }}</p>
+                </div>
+                <!-- Decorative element -->
+                <div class="absolute -right-10 -bottom-10 w-40 h-40 bg-white opacity-5 rounded-full"></div>
+            </div>
+
+            <div class="p-8 md:p-12">
+                <!-- Main Score & Breakdown -->
+                <section class="mb-12">
+                    <div class="flex flex-col md:flex-row items-center gap-12">
+                        <div class="relative flex-shrink-0">
+                            <svg class="w-48 h-48">
+                                <circle cx="96" cy="96" r="85" stroke="#e2e8f0" stroke-width="14" fill="transparent" />
+                                <circle cx="96" cy="96" r="85" stroke="#4f46e5" stroke-width="14" fill="transparent"
+                                    stroke-dasharray="534"
+                                    stroke-dashoffset="534"
+                                    style="stroke-dashoffset: calc(534 - (534 * {{ submission.score|default:0 }})); transition: stroke-dashoffset 1.5s ease-out;"
+                                    stroke-linecap="round" />
+                            </svg>
+                            <div class="absolute inset-0 flex flex-col items-center justify-center">
+                                <span class="text-5xl font-black text-gray-900">{{ submission.score_percentage|floatformat:0 }}%</span>
+                                <span class="text-xs font-bold text-gray-400 tracking-widest uppercase">{{ submission.get_grade }} Grade</span>
+                            </div>
+                        </div>
+
+                        <div class="flex-grow w-full space-y-6">
+                            <h3 class="text-sm font-bold text-indigo-500 uppercase tracking-widest mb-4">Detailed Criteria</h3>
+                            {% for criterion, s in submission.criteria_scores.items %}
+                            <div>
+                                <div class="flex justify-between items-center mb-1">
+                                    <span class="text-sm font-semibold text-gray-700 capitalize">{{ criterion }}</span>
+                                    <span class="text-sm font-bold text-indigo-600">{{ s|floatformat:0 }}%</span>
+                                </div>
+                                <div class="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                                    <div class="bg-indigo-500 h-full rounded-full transition-all duration-1000" style="width: {{ s }}%"></div>
+                                </div>
+                            </div>
+                            {% empty %}
+                            <p class="text-gray-400 italic text-sm">Waiting for rubric-based breakdown...</p>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </section>
+
+                <div class="grid md:grid-cols-2 gap-8 mb-12">
+                    <div class="p-6 bg-slate-50 rounded-2xl border border-slate-100">
+                        <label class="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Student Submission</label>
+                        {% if submission.question.question_type == 'MCQ' %}
+                            <p class="text-gray-900 font-bold">Selected: {{ submission.selected_choice.text|default:"None" }}</p>
+                        {% else %}
+                            <p class="text-gray-700 leading-relaxed italic">"{{ submission.student_answer|default:"No answer provided." }}"</p>
+                        {% endif %}
+                    </div>
+                    <div class="p-6 bg-indigo-50 rounded-2xl border border-indigo-100">
+                        <label class="block text-xs font-bold text-indigo-400 uppercase tracking-wider mb-2">Reference / Correct Answer</label>
+                        {% if submission.question.question_type == 'MCQ' %}
+                            {% for choice in submission.question.choices.all %}
+                                {% if choice.is_correct %}
+                                    <p class="text-indigo-900 font-bold">Correct: {{ choice.text }}</p>
+                                {% endif %}
+                            {% endfor %}
+                        {% else %}
+                            <p class="text-gray-700 leading-relaxed">"{{ submission.question.model_answer }}"</p>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <!-- Structured AI Feedback -->
+                <section>
+                    <h3 class="flex items-center gap-2 text-xl font-bold text-gray-900 mb-8">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                        Detailed AI Assessment
+                    </h3>
+
+                    {% if submission.feedback %}
+                    <div class="grid gap-6">
+                        <!-- Explanation -->
+                        <div class="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm">
+                            <h4 class="text-xs font-black text-indigo-500 uppercase tracking-widest mb-3">Score Explanation</h4>
+                            <p class="text-gray-700 leading-relaxed">{{ submission.feedback.explanation }}</p>
+                        </div>
+
+                        <div class="grid md:grid-cols-2 gap-6">
+                            <div class="bg-emerald-50 p-6 rounded-2xl border border-emerald-100">
+                                <h4 class="text-xs font-black text-emerald-600 uppercase tracking-widest mb-3">Key Strengths</h4>
+                                <p class="text-gray-700 text-sm leading-relaxed">{{ submission.feedback.strengths }}</p>
+                            </div>
+                            <div class="bg-rose-50 p-6 rounded-2xl border border-rose-100">
+                                <h4 class="text-xs font-black text-rose-600 uppercase tracking-widest mb-3">Major Weaknesses</h4>
+                                <p class="text-gray-700 text-sm leading-relaxed">{{ submission.feedback.weaknesses }}</p>
+                            </div>
+                        </div>
+
+                        <div class="bg-amber-50 p-6 rounded-2xl border border-amber-100">
+                            <h4 class="text-xs font-black text-amber-600 uppercase tracking-widest mb-3">Improvement Suggestions</h4>
+                            <p class="text-gray-700 text-sm leading-relaxed">{{ submission.feedback.suggestions }}</p>
+                        </div>
+                    </div>
+                    {% else %}
+                    <div class="flex flex-col items-center justify-center py-20 px-6 bg-slate-50 rounded-3xl border-2 border-dashed border-slate-200">
+                        <div class="relative mb-6">
+                            <div class="animate-ping absolute inset-0 rounded-full bg-indigo-400 opacity-20"></div>
+                            <div class="relative bg-indigo-600 rounded-full p-4">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-white animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                                </svg>
+                            </div>
+                        </div>
+                        <p class="text-lg font-bold text-gray-900">AI Analysis in Progress</p>
+                        <p class="text-gray-500 text-sm mt-2 text-center max-w-xs">DeepSeek is evaluating your rubric criteria. This usually takes 5-10 seconds.</p>
+                    </div>
+                    {% endif %}
+                </section>
+
+                <!-- Dynamic Suggested Reading -->
+                <section class="mt-12 pt-12 border-t border-gray-100">
+                    <h4 class="text-xs font-black text-gray-400 uppercase tracking-widest mb-6">AI-Generated Learning Resources</h4>
+                    <div class="flex flex-wrap gap-3">
+                        {% if submission.feedback.suggested_reading %}
+                            {% for resource in submission.feedback.suggested_reading %}
+                            <span class="px-4 py-2 bg-indigo-50 border border-indigo-100 rounded-xl text-sm font-medium text-indigo-700 hover:bg-indigo-100 transition cursor-default">
+                                {{ resource }}
+                            </span>
+                            {% endfor %}
+                        {% else %}
+                            <p class="text-sm text-gray-400 italic">Reading suggestions will appear with the analysis.</p>
+                        {% endif %}
+                    </div>
+                </section>
+            </div>
+        </div>
+    </main>
+</body>
+</html>
+
+
+================================================================================
+FILE: evaluator\templates\evaluator\student_portal.html
+================================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Student Portal | AI Evaluator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+    </style>
+</head>
+<body class="min-h-screen">
+    <nav class="bg-white shadow-sm border-b sticky top-0 z-50">
+        <div class="max-w-6xl mx-auto px-4 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-bold text-indigo-600">AI Assessment Engine</h1>
+            <div id="timer-display" class="flex items-center gap-2 px-4 py-2 bg-rose-50 text-rose-600 rounded-lg border border-rose-100 font-mono font-bold">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span id="timer">05:00</span>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto p-6 md:p-12">
+        <header class="mb-10">
+            <h2 class="text-3xl font-extrabold text-gray-900 mb-2">Student Portal</h2>
+            <p class="text-gray-600">Select a question and submit your answer for AI evaluation. The timer starts now!</p>
+        </header>
+
+        <section class="space-y-8">
+            {% for question in questions %}
+            <div class="bg-white rounded-2xl shadow-md border border-gray-100 overflow-hidden transition hover:shadow-lg">
+                <div class="p-6 md:p-8">
+                    <div class="flex items-center gap-2 mb-4">
+                        <span class="px-3 py-1 text-xs font-semibold rounded-full bg-indigo-100 text-indigo-700 uppercase">
+                            {{ question.get_question_type_display }}
+                        </span>
+                    </div>
+                    <p class="text-lg text-gray-800 font-medium mb-6 leading-relaxed">
+                        {{ question.text }}
+                    </p>
+
+                    <form id="submission-form-{{ question.id }}" action="{% url 'submit_answer' question.id %}" method="POST" class="space-y-4 submission-form">
+                        {% csrf_token %}
+                        
+                        {% if question.question_type == 'MCQ' %}
+                        <div class="space-y-3">
+                            {% for choice in question.choices.all %}
+                            <label class="flex items-center p-4 border border-gray-200 rounded-xl cursor-pointer hover:bg-indigo-50 hover:border-indigo-200 transition group">
+                                <input type="radio" name="selected_choice" value="{{ choice.id }}" class="w-5 h-5 text-indigo-600 border-gray-300 focus:ring-indigo-500" required>
+                                <span class="ml-3 text-gray-700 group-hover:text-indigo-900 transition font-medium">{{ choice.text }}</span>
+                            </label>
+                            {% endfor %}
+                        </div>
+                        {% else %}
+                        <textarea 
+                            name="answer" 
+                            rows="4" 
+                            placeholder="Type your answer here..." 
+                            class="w-full p-4 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition outline-none resize-none"
+                            required
+                        ></textarea>
+                        {% endif %}
+
+                        <button type="submit" class="w-full md:w-auto bg-indigo-600 text-white font-semibold py-3 px-8 rounded-xl hover:bg-indigo-700 transition shadow-sm hover:shadow-md">
+                            Submit for Evaluation
+                        </button>
+                    </form>
+                </div>
+            </div>
+            {% empty %}
+            <div class="text-center py-20 bg-white rounded-2xl border-2 border-dashed border-gray-200">
+                <p class="text-gray-500">No questions available yet. Check back later!</p>
+            </div>
+            {% endfor %}
+        </section>
+    </main>
+
+    <script>
+        // Simple 5-minute countdown timer
+        let timeLeft = 300; // 5 minutes in seconds
+        const timerElement = document.getElementById('timer');
+        const timerDisplay = document.getElementById('timer-display');
+
+        const countdown = setInterval(() => {
+            if (timeLeft <= 0) {
+                clearInterval(countdown);
+                autoSubmit();
+            } else {
+                timeLeft--;
+                const minutes = Math.floor(timeLeft / 60);
+                const seconds = timeLeft % 60;
+                timerElement.innerText = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+                
+                // Visual warning
+                if (timeLeft < 60) {
+                    timerDisplay.classList.add('animate-pulse');
+                    timerDisplay.classList.replace('bg-rose-50', 'bg-rose-600');
+                    timerDisplay.classList.replace('text-rose-600', 'text-white');
+                }
+            }
+        }, 1000);
+
+        function autoSubmit() {
+            const activeForm = document.querySelector('.submission-form');
+            if (activeForm) {
+                alert('Time is up! Submitting your answer automatically.');
+                activeForm.submit();
+            }
+        }
+    </script>
+</body>
+</html>
+
+
+================================================================================
+FILE: evaluator\templates\evaluator\teacher_dashboard.html
+================================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teacher Dashboard | AI Evaluator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+    </style>
+</head>
+<body class="min-h-screen">
+    <nav class="bg-indigo-900 shadow-xl border-b border-indigo-800">
+        <div class="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
+            <div class="flex items-center gap-4">
+                <div class="bg-indigo-500 p-2 rounded-lg">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                    </svg>
+                </div>
+                <h1 class="text-xl font-bold text-white">AI Educator Dashboard</h1>
+            </div>
+            <a href="{% url 'student_portal' %}" class="text-indigo-200 hover:text-white transition text-sm font-medium">Switch to Student Portal</a>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto p-6 md:p-10">
+        <!-- Stats Overview -->
+        <header class="mb-10 grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-1">Average Score</p>
+                    <h2 class="text-3xl font-black text-indigo-600">{{ stats.avg_score|mul:100|floatformat:1 }}%</h2>
+                </div>
+                <div class="bg-indigo-50 p-4 rounded-full">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                    </svg>
+                </div>
+            </div>
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-1">Total Submissions</p>
+                    <h2 class="text-3xl font-black text-gray-900">{{ stats.total_submissions }}</h2>
+                </div>
+                <div class="bg-emerald-50 p-4 rounded-full">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                    </svg>
+                </div>
+            </div>
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex items-center justify-between">
+                <div>
+                    <p class="text-xs font-bold text-rose-400 uppercase tracking-widest mb-1">Needs Review</p>
+                    <h2 class="text-3xl font-black text-rose-600">{{ stats.needs_review_total }}</h2>
+                </div>
+                <div class="bg-rose-50 p-4 rounded-full">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-rose-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                </div>
+            </div>
+        </header>
+
+        <!-- Submissions Table -->
+        <section class="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+            <div class="p-8 border-b border-gray-100 flex justify-between items-center">
+                <h3 class="text-xl font-bold text-gray-900">Recent Class Activity</h3>
+                <div class="flex gap-2">
+                    <button class="px-4 py-2 text-sm font-semibold text-gray-600 hover:bg-gray-50 rounded-lg transition border border-gray-200">Export CSV</button>
+                    <button class="px-4 py-2 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition shadow-sm">Add Question</button>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead>
+                        <tr class="bg-slate-50 text-gray-400 text-xs font-bold uppercase tracking-widest">
+                            <th class="px-8 py-4">Submission Date</th>
+                            <th class="px-8 py-4">Question Type</th>
+                            <th class="px-8 py-4">Student Answer</th>
+                            <th class="px-8 py-4 text-center">Score</th>
+                            <th class="px-8 py-4 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-100">
+                        {% for submission in submissions %}
+                        <tr class="hover:bg-indigo-50/30 transition group">
+                            <td class="px-8 py-6">
+                                <span class="text-sm font-semibold text-gray-900">{{ submission.created_at|date:"M d, Y" }}</span><br>
+                                <span class="text-xs text-gray-400">{{ submission.created_at|time }}</span>
+                            </td>
+                            <td class="px-8 py-6">
+                                <span class="px-3 py-1 text-[10px] font-bold rounded-full bg-slate-100 text-slate-600 uppercase">
+                                    {{ submission.question.get_question_type_display }}
+                                </span>
+                            </td>
+                            <td class="px-8 py-6">
+                                <p class="text-sm text-gray-600 line-clamp-1 max-w-xs italic">"{{ submission.student_answer }}"</p>
+                            </td>
+                            <td class="px-8 py-6 text-center">
+                                <span class="text-lg font-black {% if submission.score >= 0.7 %}text-emerald-600{% elif submission.score >= 0.4 %}text-amber-500{% else %}text-rose-500{% endif %}">
+                                    {{ submission.score|mul:100|floatformat:0 }}%
+                                </span>
+                            </td>
+                            <td class="px-8 py-6 text-right">
+                                <a href="{% url 'result_view' submission.id %}" class="inline-flex items-center gap-1 text-sm font-bold text-indigo-600 hover:text-indigo-800 transition">
+                                    View Detailed Insights
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                                    </svg>
+                                </a>
+                            </td>
+                        </tr>
+                        {% empty %}
+                        <tr>
+                            <td colspan="5" class="px-8 py-20 text-center text-gray-500">No submissions recorded yet.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            <div class="p-6 bg-slate-50 border-t border-gray-100 text-center">
+                <a href="#" class="text-xs font-bold text-gray-400 hover:text-indigo-600 uppercase tracking-widest transition">Load More Submissions</a>
+            </div>
+        </section>
+    </main>
+</body>
+</html>
+

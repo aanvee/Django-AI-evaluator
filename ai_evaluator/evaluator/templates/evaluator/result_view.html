@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Result View | AI Evaluator</title>
+    {% if not submission.feedback %}
+    <meta http-equiv="refresh" content="5">
+    {% endif %}
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc;
+        }
+
+        .progress-bar {
+            transition: width 1s ease-in-out;
+        }
+    </style>
+</head>
+
+<body class="min-h-screen">
+    <nav class="bg-white shadow-sm border-b">
+        <div class="max-w-6xl mx-auto px-4 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-bold text-indigo-600">AI Assessment Engine</h1>
+            <div class="flex gap-4">
+                <a href="{% url 'student_portal' %}" class="text-sm text-gray-500 hover:text-indigo-600 transition">Back
+                    to Portal</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto p-6 md:p-12">
+        <div class="bg-white rounded-3xl shadow-xl overflow-hidden border border-gray-100">
+            <div class="bg-indigo-600 p-8 text-white relative overflow-hidden">
+                <div class="relative z-10">
+                    <h2 class="text-2xl font-bold mb-2 opacity-90">Assessment Results</h2>
+                    <p class="text-indigo-100">{{ submission.question.text|truncatechars:100 }}</p>
+                </div>
+                <!-- Decorative element -->
+                <div class="absolute -right-10 -bottom-10 w-40 h-40 bg-white opacity-5 rounded-full"></div>
+            </div>
+
+            <div class="p-8 md:p-12">
+                <!-- Main Score & Breakdown -->
+                <section class="mb-12">
+                    <div class="flex flex-col md:flex-row items-center gap-12">
+                        <div class="relative flex-shrink-0">
+                            <svg class="w-48 h-48">
+                                <circle cx="96" cy="96" r="85" stroke="#e2e8f0" stroke-width="14" fill="transparent" />
+                                <circle cx="96" cy="96" r="85" stroke="#4f46e5" stroke-width="14" fill="transparent"
+                                    stroke-dasharray="534" stroke-dashoffset="534"
+                                    style="--score: {{ submission.score|default:0 }}; stroke-dashoffset: calc(534 - (534 * var(--score))); transition: stroke-dashoffset 1.5s ease-out;"
+                                    stroke-linecap="round" />
+                            </svg>
+                            <div class="absolute inset-0 flex flex-col items-center justify-center">
+                                <span class="text-5xl font-black text-gray-900">{{ submission.score_percentage|floatformat:0 }}%</span>
+                                <span class="text-xs font-bold text-gray-400 tracking-widest uppercase">{{ submission.get_grade }} Grade</span>
+                            </div>
+                        </div>
+
+                        <div class="flex-grow w-full space-y-6">
+                            <h3 class="text-sm font-bold text-indigo-500 uppercase tracking-widest mb-4">Detailed
+                                Criteria</h3>
+                            {% for criterion, s in submission.criteria_scores.items %}
+                            <div>
+                                <div class="flex justify-between items-center mb-1">
+                                    <span class="text-sm font-semibold text-gray-700 capitalize">{{ criterion }}</span>
+                                    <span class="text-sm font-bold text-indigo-600">{{ s|floatformat:0 }}%</span>
+                                </div>
+                                <div class="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                                    <div class="bg-indigo-500 h-full rounded-full transition-all duration-1000"
+                                        style="--bar-width: {{ s }}%; width: var(--bar-width);"></div>
+                                </div>
+                            </div>
+                            {% empty %}
+                            <p class="text-gray-400 italic text-sm">Waiting for rubric-based breakdown...</p>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </section>
+
+                <div class="grid md:grid-cols-2 gap-8 mb-12">
+                    <div class="p-6 bg-slate-50 rounded-2xl border border-slate-100">
+                        <label class="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Student
+                            Submission</label>
+                        {% if submission.question.question_type == 'MCQ' %}
+                        <p class="text-gray-900 font-bold">Selected: {{ submission.selected_choice.text|default:"None" }}</p>
+                        {% else %}
+                        <p class="text-gray-700 leading-relaxed italic">"{{ submission.student_answer|default:"No answer provided." }}"</p>
+                        {% endif %}
+                    </div>
+                    <div class="p-6 bg-indigo-50 rounded-2xl border border-indigo-100">
+                        <label class="block text-xs font-bold text-indigo-400 uppercase tracking-wider mb-2">Reference /
+                            Correct Answer</label>
+                        {% if submission.question.question_type == 'MCQ' %}
+                        {% for choice in submission.question.choices.all %}
+                        {% if choice.is_correct %}
+                        <p class="text-indigo-900 font-bold">Correct: {{ choice.text }}</p>
+                        {% endif %}
+                        {% endfor %}
+                        {% else %}
+                        <p class="text-gray-700 leading-relaxed">"{{ submission.question.model_answer }}"</p>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <!-- Structured AI Feedback -->
+                <section>
+                    <h3 class="flex items-center gap-2 text-xl font-bold text-gray-900 mb-8">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-indigo-600" fill="none"
+                            viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                        Detailed AI Assessment
+                    </h3>
+
+                    {% if submission.feedback %}
+                    <div class="grid gap-6">
+                        <!-- Explanation -->
+                        <div class="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm">
+                            <h4 class="text-xs font-black text-indigo-500 uppercase tracking-widest mb-3">Score
+                                Explanation</h4>
+                            <p class="text-gray-700 leading-relaxed">{{ submission.feedback.explanation }}</p>
+                        </div>
+
+                        <div class="grid md:grid-cols-2 gap-6">
+                            <div class="bg-emerald-50 p-6 rounded-2xl border border-emerald-100">
+                                <h4 class="text-xs font-black text-emerald-600 uppercase tracking-widest mb-3">Key
+                                    Strengths</h4>
+                                <p class="text-gray-700 text-sm leading-relaxed">{{ submission.feedback.strengths }}</p>
+                            </div>
+                            <div class="bg-rose-50 p-6 rounded-2xl border border-rose-100">
+                                <h4 class="text-xs font-black text-rose-600 uppercase tracking-widest mb-3">Major
+                                    Weaknesses</h4>
+                                <p class="text-gray-700 text-sm leading-relaxed">{{ submission.feedback.weaknesses }}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div class="bg-amber-50 p-6 rounded-2xl border border-amber-100">
+                            <h4 class="text-xs font-black text-amber-600 uppercase tracking-widest mb-3">Improvement
+                                Suggestions</h4>
+                            <p class="text-gray-700 text-sm leading-relaxed">{{ submission.feedback.suggestions }}</p>
+                        </div>
+                    </div>
+                    {% else %}
+                    <div
+                        class="flex flex-col items-center justify-center py-20 px-6 bg-slate-50 rounded-3xl border-2 border-dashed border-slate-200">
+                        <div class="relative mb-6">
+                            <div class="animate-ping absolute inset-0 rounded-full bg-indigo-400 opacity-20"></div>
+                            <div class="relative bg-indigo-600 rounded-full p-4">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-white animate-pulse"
+                                    fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                                </svg>
+                            </div>
+                        </div>
+                        <p class="text-lg font-bold text-gray-900">AI Analysis in Progress</p>
+                        <p class="text-gray-500 text-sm mt-2 text-center max-w-xs">DeepSeek is evaluating your rubric
+                            criteria. This usually takes 5-10 seconds.</p>
+                    </div>
+                    {% endif %}
+                </section>
+
+                <!-- Dynamic Suggested Reading -->
+                <section class="mt-12 pt-12 border-t border-gray-100">
+                    <h4 class="text-xs font-black text-gray-400 uppercase tracking-widest mb-6">AI-Generated Learning
+                        Resources</h4>
+                    <div class="flex flex-wrap gap-3">
+                        {% if submission.feedback.suggested_reading %}
+                        {% for resource in submission.feedback.suggested_reading %}
+                        <span
+                            class="px-4 py-2 bg-indigo-50 border border-indigo-100 rounded-xl text-sm font-medium text-indigo-700 hover:bg-indigo-100 transition cursor-default">
+                            {{ resource }}
+                        </span>
+                        {% endfor %}
+                        {% else %}
+                        <p class="text-sm text-gray-400 italic">Reading suggestions will appear with the analysis.</p>
+                        {% endif %}
+                    </div>
+                </section>
+            </div>
+        </div>
+    </main>
+</body>
+
+</html>
