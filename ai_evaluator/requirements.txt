@@ -1,0 +1,5 @@
+sentence-transformers
+torch
+langchain_openai
+pydantic
+django-q
